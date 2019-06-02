@@ -9,8 +9,10 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"net"
 	"strings"
 
+	"github.com/jpillora/sizestr"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -41,17 +43,16 @@ func FingerprintKey(k ssh.PublicKey) string {
 	return strings.Join(strbytes, ":")
 }
 
-func OpenStream(conn ssh.Conn, remote string) (io.ReadWriteCloser, error) {
-	stream, reqs, err := conn.OpenChannel("chisel", []byte(remote))
+func HandleTCPStream(l *Logger, connStats *ConnStats, src io.ReadWriteCloser, remote string) {
+	dst, err := net.Dial("tcp", remote)
 	if err != nil {
-		return nil, err
+		l.Debugf("Remote failed (%s)", err)
+		src.Close()
+		return
 	}
-	go ssh.DiscardRequests(reqs)
-	return stream, nil
-}
-
-func RejectStreams(chans <-chan ssh.NewChannel) {
-	for ch := range chans {
-		ch.Reject(ssh.Prohibited, "Tunnels disallowed")
-	}
+	connStats.Open()
+	l.Debugf("%s: Open", connStats)
+	s, r := Pipe(src, dst)
+	connStats.Close()
+	l.Debugf("%s: Close (sent %s received %s)", connStats, sizestr.ToString(s), sizestr.ToString(r))
 }

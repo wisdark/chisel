@@ -61,11 +61,16 @@ func main() {
 }
 
 var commonHelp = `
-    --pid Generate pid file in current directory
+    --pid Generate pid file in current working directory
 
     -v, Enable verbose logging
 
     --help, This help text
+
+  Signals:
+    The chisel process is listening for:
+      a SIGUSR2 to print process stats, and
+      a SIGHUP to short-circuit the client reconnect timer
 
   Version:
     ` + chshare.BuildVersion + `
@@ -94,7 +99,7 @@ var serverHelp = `
     variable PORT and fallsback to port 8080).
 
     --key, An optional string to seed the generation of a ECDSA public
-    and private key pair. All commications will be secured using this
+    and private key pair. All communications will be secured using this
     key pair. Share the subsequent fingerprint with clients to enable detection
     of man-in-the-middle attacks (defaults to the CHISEL_KEY environment
     variable, otherwise a new key is generate each run).
@@ -107,7 +112,9 @@ var serverHelp = `
     when <user> connects, their <pass> will be verified and then
     each of the remote addresses will be compared against the list
     of address regular expressions for a match. Addresses will
-    always come in the form "<host/ip>:<port>".
+    always come in the form "<remote-host>:<remote-port>" for normal remotes
+    and "R:<local-interface>:<local-port>" for reverse port forwarding
+    remotes. This file will be automatically reloaded on change.
 
     --auth, An optional string representing a single user with full
     access, in the form of <user:pass>. This is equivalent to creating an
@@ -117,8 +124,11 @@ var serverHelp = `
     chisel receives a normal HTTP request. Useful for hiding chisel in
     plain sight.
 
-    --socks5, Allows client to access the internal SOCKS5 proxy. See
+    --socks5, Allow clients to access the internal SOCKS5 proxy. See
     chisel client --help for more information.
+
+    --reverse, Allow clients to specify reverse port forwarding remotes
+    in addition to normal remotes.
 ` + commonHelp
 
 func server(args []string) {
@@ -133,6 +143,7 @@ func server(args []string) {
 	auth := flags.String("auth", "", "")
 	proxy := flags.String("proxy", "", "")
 	socks5 := flags.Bool("socks5", false, "")
+	reverse := flags.Bool("reverse", false, "")
 	pid := flags.Bool("pid", false, "")
 	verbose := flags.Bool("v", false, "")
 
@@ -166,6 +177,7 @@ func server(args []string) {
 		Auth:     *auth,
 		Proxy:    *proxy,
 		Socks5:   *socks5,
+		Reverse:  *reverse,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -174,6 +186,7 @@ func server(args []string) {
 	if *pid {
 		generatePidFile()
 	}
+	go chshare.GoStats()
 	if err = s.Run(*host, *port); err != nil {
 		log.Fatal(err)
 	}
@@ -184,7 +197,7 @@ var clientHelp = `
 
   <server> is the URL to the chisel server.
 
-  <remote>s are remote connections tunnelled through the server, each of
+  <remote>s are remote connections tunneled through the server, each of
   which come in the form:
 
     <local-host>:<local-port>:<remote-host>:<remote-port>
@@ -194,6 +207,14 @@ var clientHelp = `
     ■ remote-port is required*.
     ■ remote-host defaults to 0.0.0.0 (server localhost).
 
+  which shares <remote-host>:<remote-port> from the server to the client
+  as <local-host>:<local-port>, or:
+
+    R:<local-interface>:<local-port>:<remote-host>:<remote-port>
+
+  which does reverse port forwarding, sharing <remote-host>:<remote-port>
+  from the client to the server's <local-interface>:<local-port>.
+
     example remotes
 
       3000
@@ -202,12 +223,18 @@ var clientHelp = `
       192.168.0.5:3000:google.com:80
       socks
       5000:socks
+      R:2222:localhost:22
 
-    *When the chisel server has --socks5 enabled, remotes can
+    When the chisel server has --socks5 enabled, remotes can
     specify "socks" in place of remote-host and remote-port.
     The default local host and port for a "socks" remote is
     127.0.0.1:1080. Connections to this remote will terminate
     at the server's internal SOCKS5 proxy.
+
+    When the chisel server has --reverse enabled, remotes can
+    be prefixed with R to denote that they are reversed. That
+    is, the server will listen and accept connections, and they
+    will be proxied through the client which specified the remote.
 
   Options:
 
@@ -227,9 +254,18 @@ var clientHelp = `
     specify a time with a unit, for example '30s' or '2m'. Defaults
     to '0s' (disabled).
 
+    --max-retry-count, Maximum number of times to retry before exiting.
+    Defaults to unlimited.
+
+    --max-retry-interval, Maximum wait time before retrying after a
+    disconnection. Defaults to 5 minutes.
+
     --proxy, An optional HTTP CONNECT proxy which will be used reach
     the chisel server. Authentication can be specified inside the URL.
     For example, http://admin:password@my-server.com:8081
+
+    --hostname, Optionally set the 'Host' header (defaults to the host
+    found in the server url).
 ` + commonHelp
 
 func client(args []string) {
@@ -239,8 +275,11 @@ func client(args []string) {
 	fingerprint := flags.String("fingerprint", "", "")
 	auth := flags.String("auth", "", "")
 	keepalive := flags.Duration("keepalive", 0, "")
+	maxRetryCount := flags.Int("max-retry-count", -1, "")
+	maxRetryInterval := flags.Duration("max-retry-interval", 0, "")
 	proxy := flags.String("proxy", "", "")
 	pid := flags.Bool("pid", false, "")
+	hostname := flags.String("hostname", "", "")
 	verbose := flags.Bool("v", false, "")
 	flags.Usage = func() {
 		fmt.Print(clientHelp)
@@ -252,18 +291,19 @@ func client(args []string) {
 	if len(args) < 2 {
 		log.Fatalf("A server and least one remote is required")
 	}
-
 	if *auth == "" {
 		*auth = os.Getenv("AUTH")
 	}
-
 	c, err := chclient.NewClient(&chclient.Config{
-		Fingerprint: *fingerprint,
-		Auth:        *auth,
-		KeepAlive:   *keepalive,
-		HTTPProxy:   *proxy,
-		Server:      args[0],
-		Remotes:     args[1:],
+		Fingerprint:      *fingerprint,
+		Auth:             *auth,
+		KeepAlive:        *keepalive,
+		MaxRetryCount:    *maxRetryCount,
+		MaxRetryInterval: *maxRetryInterval,
+		HTTPProxy:        *proxy,
+		Server:           args[0],
+		Remotes:          args[1:],
+		HostHeader:       *hostname,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -272,6 +312,7 @@ func client(args []string) {
 	if *pid {
 		generatePidFile()
 	}
+	go chshare.GoStats()
 	if err = c.Run(); err != nil {
 		log.Fatal(err)
 	}

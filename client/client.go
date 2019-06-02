@@ -1,6 +1,7 @@
 package chclient
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -18,13 +19,16 @@ import (
 
 //Config represents a client configuration
 type Config struct {
-	shared      *chshare.Config
-	Fingerprint string
-	Auth        string
-	KeepAlive   time.Duration
-	Server      string
-	HTTPProxy   string
-	Remotes     []string
+	shared           *chshare.Config
+	Fingerprint      string
+	Auth             string
+	KeepAlive        time.Duration
+	MaxRetryCount    int
+	MaxRetryInterval time.Duration
+	Server           string
+	HTTPProxy        string
+	Remotes          []string
+	HostHeader       string
 }
 
 //Client represents a client instance
@@ -32,27 +36,27 @@ type Client struct {
 	*chshare.Logger
 	config       *Config
 	sshConfig    *ssh.ClientConfig
-	proxies      []*tcpProxy
 	sshConn      ssh.Conn
 	httpProxyURL *url.URL
 	server       string
 	running      bool
 	runningc     chan error
+	connStats    chshare.ConnStats
 }
 
 //NewClient creates a new client instance
 func NewClient(config *Config) (*Client, error) {
-
 	//apply default scheme
 	if !strings.HasPrefix(config.Server, "http") {
 		config.Server = "http://" + config.Server
 	}
-
+	if config.MaxRetryInterval < time.Second {
+		config.MaxRetryInterval = 5 * time.Minute
+	}
 	u, err := url.Parse(config.Server)
 	if err != nil {
 		return nil, err
 	}
-
 	//apply default port
 	if !regexp.MustCompile(`:\d+$`).MatchString(u.Host) {
 		if u.Scheme == "https" || u.Scheme == "wss" {
@@ -61,10 +65,8 @@ func NewClient(config *Config) (*Client, error) {
 			u.Host = u.Host + ":80"
 		}
 	}
-
 	//swap to websockets scheme
 	u.Scheme = strings.Replace(u.Scheme, "http", "ws", 1)
-
 	shared := &chshare.Config{}
 	for _, s := range config.Remotes {
 		r, err := chshare.DecodeRemote(s)
@@ -74,7 +76,6 @@ func NewClient(config *Config) (*Client, error) {
 		shared.Remotes = append(shared.Remotes, r)
 	}
 	config.shared = shared
-
 	client := &Client{
 		Logger:   chshare.NewLogger("client"),
 		config:   config,
@@ -96,8 +97,9 @@ func NewClient(config *Config) (*Client, error) {
 	client.sshConfig = &ssh.ClientConfig{
 		User:            user,
 		Auth:            []ssh.AuthMethod{ssh.Password(pass)},
-		ClientVersion:   chshare.ProtocolVersion + "-client",
+		ClientVersion:   "SSH-" + chshare.ProtocolVersion + "-client",
 		HostKeyCallback: client.verifyServer,
+		Timeout:         30 * time.Second,
 	}
 
 	return client, nil
@@ -105,7 +107,9 @@ func NewClient(config *Config) (*Client, error) {
 
 //Run starts client and blocks while connected
 func (c *Client) Run() error {
-	if err := c.Start(); err != nil {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
 		return err
 	}
 	return c.Wait()
@@ -123,55 +127,71 @@ func (c *Client) verifyServer(hostname string, remote net.Addr, key ssh.PublicKe
 }
 
 //Start client and does not block
-func (c *Client) Start() error {
+func (c *Client) Start(ctx context.Context) error {
 	via := ""
 	if c.httpProxyURL != nil {
 		via = " via " + c.httpProxyURL.String()
 	}
-	//prepare proxies
+	//prepare non-reverse proxies
 	for i, r := range c.config.shared.Remotes {
-		proxy := newTCPProxy(c, i, r)
-		if err := proxy.start(); err != nil {
-			return err
+		if !r.Reverse {
+			proxy := chshare.NewTCPProxy(c.Logger, func() ssh.Conn { return c.sshConn }, i, r)
+			if err := proxy.Start(ctx); err != nil {
+				return err
+			}
 		}
-		c.proxies = append(c.proxies, proxy)
 	}
 	c.Infof("Connecting to %s%s\n", c.server, via)
-	//
-	go c.loop()
+	//optional keepalive loop
+	if c.config.KeepAlive > 0 {
+		go c.keepAliveLoop()
+	}
+	//connection loop
+	go c.connectionLoop()
 	return nil
 }
 
-func (c *Client) loop() {
-	//optional keepalive loop
-	if c.config.KeepAlive > 0 {
-		go func() {
-			for range time.Tick(c.config.KeepAlive) {
-				if c.sshConn != nil {
-					c.sshConn.SendRequest("ping", true, nil)
-				}
-			}
-		}()
+func (c *Client) keepAliveLoop() {
+	for c.running {
+		time.Sleep(c.config.KeepAlive)
+		if c.sshConn != nil {
+			c.sshConn.SendRequest("ping", true, nil)
+		}
 	}
+}
+
+func (c *Client) connectionLoop() {
 	//connection loop!
 	var connerr error
-	b := &backoff.Backoff{Max: 5 * time.Minute}
-	for {
-		//NOTE: break == dont retry on handshake failures
-		if !c.running {
-			break
-		}
+	b := &backoff.Backoff{Max: c.config.MaxRetryInterval}
+	for c.running {
 		if connerr != nil {
+			attempt := int(b.Attempt())
+			maxAttempt := c.config.MaxRetryCount
 			d := b.Duration()
-			c.Debugf("Connection error: %s", connerr)
+			//show error and attempt counts
+			msg := fmt.Sprintf("Connection error: %s", connerr)
+			if attempt > 0 {
+				msg += fmt.Sprintf(" (Attempt: %d", attempt)
+				if maxAttempt > 0 {
+					msg += fmt.Sprintf("/%d", maxAttempt)
+				}
+				msg += ")"
+			}
+			c.Debugf(msg)
+			//give up?
+			if maxAttempt >= 0 && attempt >= maxAttempt {
+				break
+			}
 			c.Infof("Retrying in %s...", d)
 			connerr = nil
-			time.Sleep(d)
+			chshare.SleepSignal(d)
 		}
 		d := websocket.Dialer{
-			ReadBufferSize:  1024,
-			WriteBufferSize: 1024,
-			Subprotocols:    []string{chshare.ProtocolVersion},
+			ReadBufferSize:   1024,
+			WriteBufferSize:  1024,
+			HandshakeTimeout: 45 * time.Second,
+			Subprotocols:     []string{chshare.ProtocolVersion},
 		}
 		//optionally CONNECT proxy
 		if c.httpProxyURL != nil {
@@ -179,7 +199,13 @@ func (c *Client) loop() {
 				return c.httpProxyURL, nil
 			}
 		}
-		wsConn, _, err := d.Dial(c.server, nil)
+		wsHeaders := http.Header{}
+		if c.config.HostHeader != "" {
+			wsHeaders = http.Header{
+				"Host": {c.config.HostHeader},
+			}
+		}
+		wsConn, _, err := d.Dial(c.server, wsHeaders)
 		if err != nil {
 			connerr = err
 			continue
@@ -199,7 +225,7 @@ func (c *Client) loop() {
 		}
 		c.config.shared.Version = chshare.BuildVersion
 		conf, _ := chshare.EncodeConfig(c.config.shared)
-		c.Debugf("Sending configurating")
+		c.Debugf("Sending config")
 		t0 := time.Now()
 		_, configerr, err := sshConn.SendRequest("config", true, conf)
 		if err != nil {
@@ -210,12 +236,12 @@ func (c *Client) loop() {
 			c.Infof(string(configerr))
 			break
 		}
-		c.Infof("Connected (Latency %s)", time.Now().Sub(t0))
+		c.Infof("Connected (Latency %s)", time.Since(t0))
 		//connected
 		b.Reset()
 		c.sshConn = sshConn
 		go ssh.DiscardRequests(reqs)
-		go chshare.RejectStreams(chans) //TODO allow client to ConnectStreams
+		go c.connectStreams(chans)
 		err = sshConn.Wait()
 		//disconnected
 		c.sshConn = nil
@@ -234,11 +260,25 @@ func (c *Client) Wait() error {
 	return <-c.runningc
 }
 
-//Close manual stops the client
+//Close manually stops the client
 func (c *Client) Close() error {
 	c.running = false
 	if c.sshConn == nil {
 		return nil
 	}
 	return c.sshConn.Close()
+}
+
+func (c *Client) connectStreams(chans <-chan ssh.NewChannel) {
+	for ch := range chans {
+		remote := string(ch.ExtraData())
+		stream, reqs, err := ch.Accept()
+		if err != nil {
+			c.Debugf("Failed to accept stream: %s", err)
+			continue
+		}
+		go ssh.DiscardRequests(reqs)
+		l := c.Logger.Fork("conn#%d", c.connStats.New())
+		go chshare.HandleTCPStream(l, &c.connStats, stream, remote)
+	}
 }
