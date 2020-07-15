@@ -12,10 +12,9 @@ import (
 
 	socks5 "github.com/armon/go-socks5"
 	"github.com/gorilla/websocket"
+	chshare "github.com/jpillora/chisel/share"
 	"github.com/jpillora/requestlog"
 	"golang.org/x/crypto/ssh"
-
-	"github.com/jpillora/chisel/share"
 )
 
 // Config is the configuration for the chisel service
@@ -145,7 +144,9 @@ func (s *Server) Start(host, port string) error {
 	s.Infof("Listening on %s:%s...", host, port)
 	h := http.Handler(http.HandlerFunc(s.handleClientHandler))
 	if s.Debug {
-		h = requestlog.Wrap(h)
+		o := requestlog.DefaultOptions
+		o.TrustProxy = true
+		h = requestlog.WrapWith(h, o)
 	}
 	return s.httpServer.GoListenAndServe(host+":"+port, h)
 }

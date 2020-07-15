@@ -1,6 +1,6 @@
 # chisel
 
-[![GoDoc](https://godoc.org/github.com/jpillora/chisel?status.svg)](https://godoc.org/github.com/jpillora/chisel)
+[![GoDoc](https://godoc.org/github.com/jpillora/chisel?status.svg)](https://godoc.org/github.com/jpillora/chisel) [![CI](https://github.com/jpillora/chisel/workflows/CI/badge.svg)](https://github.com/jpillora/chisel/actions?workflow=CI)
 
 Chisel is a fast TCP tunnel, transported over HTTP, secured via SSH. Single executable including both client and server. Written in Go (golang). Chisel is mainly useful for passing through firewalls, though it can also be used to provide a secure endpoint into your network. Chisel is very similar to [crowbar](https://github.com/q3k/crowbar) though achieves **much** higher [performance](#performance).
 
@@ -13,11 +13,13 @@ Chisel is a fast TCP tunnel, transported over HTTP, secured via SSH. Single exec
 - [Encrypted connections](#security) using the SSH protocol (via `crypto/ssh`)
 - [Authenticated connections](#authentication); authenticated client connections with a users config file, authenticated server connections with fingerprint matching.
 - Client auto-reconnects with [exponential backoff](https://github.com/jpillora/backoff)
-- Client can create multiple tunnel endpoints over one TCP connection
-- Client can optionally pass through HTTP CONNECT proxies
+- Clients can create multiple tunnel endpoints over one TCP connection
+- Clients can optionally pass through SOCKS or HTTP CONNECT proxies
+- Reverse port forwarding (Connections go through the server and out the client)
 - Server optionally doubles as a [reverse proxy](http://golang.org/pkg/net/http/httputil/#NewSingleHostReverseProxy)
 - Server optionally allows [SOCKS5](https://en.wikipedia.org/wiki/SOCKS) connections (See [guide below](#socks5-guide))
-- Reverse port forwarding
+- Clients optionally allow [SOCKS5](https://en.wikipedia.org/wiki/SOCKS) connections from a reversed port forward
+- Client connections over stdio which supports `ssh -o ProxyCommand` providing SSH over HTTP
 
 ### Install
 
@@ -67,7 +69,7 @@ $ chisel --help
 
    Usage: chisel [command] [--help]
 
-   Version: X.Y.Z
+   Version: 1.X.X
 
    Commands:
      server - runs chisel in server mode
@@ -134,11 +136,10 @@ $ chisel server --help
       a SIGHUP to short-circuit the client reconnect timer
 
   Version:
-    X.Y.Z
+    1.X.X (go1.14)
 
   Read more:
     https://github.com/jpillora/chisel
-
 
 ```
 
@@ -176,6 +177,9 @@ $ chisel client --help
       socks
       5000:socks
       R:2222:localhost:22
+      R:socks
+      R:5000:socks
+      stdio:example.com:22
 
     When the chisel server has --socks5 enabled, remotes can
     specify "socks" in place of remote-host and remote-port.
@@ -187,6 +191,16 @@ $ chisel client --help
     be prefixed with R to denote that they are reversed. That
     is, the server will listen and accept connections, and they
     will be proxied through the client which specified the remote.
+    Reverse remotes specifying "R:socks" will listen on the server's
+    default socks port (1080) and terminate the connection at the
+    client's internal SOCKS5 proxy.
+
+    When stdio is used as local-host, the tunnel will connect standard
+    input/output of this program with the remote. This is useful when 
+    combined with ssh ProxyCommand. You can use
+      ssh -o ProxyCommand='chisel client chiselserver stdio:%h:%p' \
+          user@example.com
+    to connect to an SSH server through the tunnel.
 
   Options:
 
@@ -212,12 +226,17 @@ $ chisel client --help
     --max-retry-interval, Maximum wait time before retrying after a
     disconnection. Defaults to 5 minutes.
 
-    --proxy, An optional HTTP CONNECT proxy which will be used reach
-    the chisel server. Authentication can be specified inside the URL.
+    --proxy, An optional HTTP CONNECT or SOCKS5 proxy which will be
+    used to reach the chisel server. Authentication can be specified
+    inside the URL.
     For example, http://admin:password@my-server.com:8081
+             or: socks://admin:password@my-server.com:1080
+
+    --header, Set a custom header in the form "HeaderName: HeaderContent".
+    Can be used multiple times. (e.g --header "Foo: Bar" --header "Hello: World")
 
     --hostname, Optionally set the 'Host' header (defaults to the host
-    defined in the endpoint url).
+    found in the server url).
 
     --pid Generate pid file in current working directory
 
@@ -231,11 +250,10 @@ $ chisel client --help
       a SIGHUP to short-circuit the client reconnect timer
 
   Version:
-    X.Y.Z
+    1.X.X (go1.14)
 
   Read more:
     https://github.com/jpillora/chisel
-
 
 ```
 
@@ -370,26 +388,3 @@ See more [test/](test/)
 - Better, faster tests
 - Expose a stats page for proxy throughput
 - Treat client stdin/stdout as a socket
-
-#### MIT License
-
-Copyright © 2017 Jaime Pillora &lt;dev@jpillora.com&gt;
-
-Permission is hereby granted, free of charge, to any person obtaining
-a copy of this software and associated documentation files (the
-'Software'), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
-
-The above copyright notice and this permission notice shall be
-included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND,
-EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
