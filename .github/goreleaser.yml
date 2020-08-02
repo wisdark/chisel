@@ -1,11 +1,13 @@
 # test this goreleaser config with:
-# - cd chisel/
+# - cd chisel
 # - goreleaser --skip-publish --rm-dist --config .github/goreleaser.yml
 builds:
   - env:
       - CGO_ENABLED=0
     ldflags:
       - -s -w -X github.com/jpillora/chisel/share.BuildVersion={{.Version}}
+    flags:
+      - -trimpath
     goos:
       - linux
       - darwin
@@ -36,6 +38,8 @@ archives:
   - format: gz
     files:
       - none*
+release:
+  prerelease: auto
 changelog:
   sort: asc
   filters:

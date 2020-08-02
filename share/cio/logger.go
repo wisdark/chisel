@@ -1,4 +1,4 @@
-package chshare
+package cio
 
 import (
 	"fmt"
@@ -8,9 +8,11 @@ import (
 
 //Logger is pkg/log Logger with prefixing and 2 log levels
 type Logger struct {
+	Info, Debug bool
+	//internal
 	prefix      string
 	logger      *log.Logger
-	Info, Debug bool
+	info, debug *bool
 }
 
 func NewLogger(prefix string) *Logger {
@@ -28,13 +30,13 @@ func NewLoggerFlag(prefix string, flag int) *Logger {
 }
 
 func (l *Logger) Infof(f string, args ...interface{}) {
-	if l.Info {
+	if l.IsInfo() {
 		l.logger.Printf(l.prefix+": "+f, args...)
 	}
 }
 
 func (l *Logger) Debugf(f string, args ...interface{}) {
-	if l.Debug {
+	if l.IsDebug() {
 		l.logger.Printf(l.prefix+": "+f, args...)
 	}
 }
@@ -47,11 +49,30 @@ func (l *Logger) Fork(prefix string, args ...interface{}) *Logger {
 	//slip the parent prefix at the front
 	args = append([]interface{}{l.prefix}, args...)
 	ll := NewLogger(fmt.Sprintf("%s: "+prefix, args...))
+	//store link to parent settings too
 	ll.Info = l.Info
+	if l.info != nil {
+		ll.info = l.info
+	} else {
+		ll.info = &l.Info
+	}
 	ll.Debug = l.Debug
+	if l.debug != nil {
+		ll.debug = l.debug
+	} else {
+		ll.debug = &l.Debug
+	}
 	return ll
 }
 
 func (l *Logger) Prefix() string {
 	return l.prefix
+}
+
+func (l *Logger) IsInfo() bool {
+	return l.Info || (l.info != nil && *l.info)
+}
+
+func (l *Logger) IsDebug() bool {
+	return l.Debug || (l.debug != nil && *l.debug)
 }

@@ -10,16 +10,18 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	chclient "github.com/jpillora/chisel/client"
 	chserver "github.com/jpillora/chisel/server"
 	chshare "github.com/jpillora/chisel/share"
+	"github.com/jpillora/chisel/share/cos"
 )
 
 var help = `
   Usage: chisel [command] [--help]
 
-  Version: ` + chshare.BuildVersion + `
+  Version: ` + chshare.BuildVersion + ` (` + runtime.Version() + `)
 
   Commands:
     server - runs chisel in server mode
@@ -120,8 +122,15 @@ var serverHelp = `
     remotes. This file will be automatically reloaded on change.
 
     --auth, An optional string representing a single user with full
-    access, in the form of <user:pass>. This is equivalent to creating an
-    authfile with {"<user:pass>": [""]}.
+    access, in the form of <user:pass>. It is equivalent to creating an
+    authfile with {"<user:pass>": [""]}. If unset, it will use the
+    environment variable AUTH.
+
+    --keepalive, An optional keepalive interval. Since the underlying
+    transport is HTTP, in many instances we'll be traversing through
+    proxies, often these proxies will close idle connections. You must
+    specify a time with a unit, for example '5s' or '2m'. Defaults
+    to '25s' (set to 0s to disable).
 
     --proxy, Specifies another HTTP server to proxy requests to when
     chisel receives a normal HTTP request. Useful for hiding chisel in
@@ -132,21 +141,43 @@ var serverHelp = `
 
     --reverse, Allow clients to specify reverse port forwarding remotes
     in addition to normal remotes.
+
+    --tls-key, Enables TLS and provides optional path to a PEM-encoded
+    TLS private key. When this flag is set, you must also set --tls-cert,
+    and you cannot set --tls-domain.
+
+    --tls-cert, Enables TLS and provides optional path to a PEM-encoded
+    TLS certificate. When this flag is set, you must also set --tls-key,
+    and you cannot set --tls-domain.
+
+    --tls-domain, Enables TLS and automatically acquires a TLS key and
+    certificate using LetsEncypt. Setting --tls-domain requires port 443.
+    You may specify multiple --tls-domain flags to serve multiple domains.
+    The resulting files are cached in the "$HOME/.cache/chisel" directory.
+    You can modify this path by setting the CHISEL_LE_CACHE variable,
+    or disable caching by setting this variable to "-". You can optionally
+    provide a certificate notification email by setting CHISEL_LE_EMAIL.
 ` + commonHelp
 
 func server(args []string) {
 
 	flags := flag.NewFlagSet("server", flag.ContinueOnError)
 
+	config := &chserver.Config{}
+	flags.StringVar(&config.KeySeed, "key", "", "")
+	flags.StringVar(&config.AuthFile, "authfile", "", "")
+	flags.StringVar(&config.Auth, "auth", "", "")
+	flags.DurationVar(&config.KeepAlive, "keepalive", 25*time.Second, "")
+	flags.StringVar(&config.Proxy, "proxy", "", "")
+	flags.BoolVar(&config.Socks5, "socks5", false, "")
+	flags.BoolVar(&config.Reverse, "reverse", false, "")
+	flags.StringVar(&config.TLS.Key, "tls-key", "", "")
+	flags.StringVar(&config.TLS.Cert, "tls-cert", "", "")
+	flags.Var(multiFlag{&config.TLS.Domains}, "tls-domain", "")
+
 	host := flags.String("host", "", "")
 	p := flags.String("p", "", "")
 	port := flags.String("port", "", "")
-	key := flags.String("key", "", "")
-	authfile := flags.String("authfile", "", "")
-	auth := flags.String("auth", "", "")
-	proxy := flags.String("proxy", "", "")
-	socks5 := flags.Bool("socks5", false, "")
-	reverse := flags.Bool("reverse", false, "")
 	pid := flags.Bool("pid", false, "")
 	verbose := flags.Bool("v", false, "")
 
@@ -171,17 +202,10 @@ func server(args []string) {
 	if *port == "" {
 		*port = "8080"
 	}
-	if *key == "" {
-		*key = os.Getenv("CHISEL_KEY")
+	if config.KeySeed == "" {
+		config.KeySeed = os.Getenv("CHISEL_KEY")
 	}
-	s, err := chserver.NewServer(&chserver.Config{
-		KeySeed:  *key,
-		AuthFile: *authfile,
-		Auth:     *auth,
-		Proxy:    *proxy,
-		Socks5:   *socks5,
-		Reverse:  *reverse,
-	})
+	s, err := chserver.NewServer(config)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -189,10 +213,27 @@ func server(args []string) {
 	if *pid {
 		generatePidFile()
 	}
-	go chshare.GoStats()
-	if err = s.Run(*host, *port); err != nil {
+	go cos.GoStats()
+	ctx := cos.InterruptContext()
+	if err := s.StartContext(ctx, *host, *port); err != nil {
 		log.Fatal(err)
 	}
+	if err := s.Wait(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+type multiFlag struct {
+	values *[]string
+}
+
+func (flag multiFlag) String() string {
+	return strings.Join(*flag.values, ", ")
+}
+
+func (flag multiFlag) Set(arg string) error {
+	*flag.values = append(*flag.values, arg)
+	return nil
 }
 
 type headerFlags struct {
@@ -293,8 +334,8 @@ var clientHelp = `
     --keepalive, An optional keepalive interval. Since the underlying
     transport is HTTP, in many instances we'll be traversing through
     proxies, often these proxies will close idle connections. You must
-    specify a time with a unit, for example '30s' or '2m'. Defaults
-    to '0s' (disabled).
+    specify a time with a unit, for example '5s' or '2m'. Defaults
+    to '25s' (set to 0s to disable).
 
     --max-retry-count, Maximum number of times to retry before exiting.
     Defaults to unlimited.
@@ -306,13 +347,25 @@ var clientHelp = `
     used to reach the chisel server. Authentication can be specified
     inside the URL.
     For example, http://admin:password@my-server.com:8081
-             or: socks://admin:password@my-server.com:1080
+            or: socks://admin:password@my-server.com:1080
 
     --header, Set a custom header in the form "HeaderName: HeaderContent".
     Can be used multiple times. (e.g --header "Foo: Bar" --header "Hello: World")
 
     --hostname, Optionally set the 'Host' header (defaults to the host
     found in the server url).
+
+    --tls-ca, An optional root certificate bundle used to verify the
+    chisel server. Only valid when connecting to the server with
+    "https" or "wss". By default, the operating system CAs will be used.
+
+    --tls-skip-verify, Skip server TLS certificate verification of
+    chain and host name (if TLS is used for transport connections to
+    server). If set, client accepts any TLS certificate presented by
+    the server and any host name in that certificate. This only affects
+    transport https (wss) connection. Chisel server's public key
+    may be still verified (see --fingerprint) after inner connection
+    is established.
 ` + commonHelp
 
 func client(args []string) {
@@ -320,10 +373,12 @@ func client(args []string) {
 	config := chclient.Config{Headers: http.Header{}}
 	flags.StringVar(&config.Fingerprint, "fingerprint", "", "")
 	flags.StringVar(&config.Auth, "auth", "", "")
-	flags.DurationVar(&config.KeepAlive, "keepalive", 0, "")
+	flags.DurationVar(&config.KeepAlive, "keepalive", 25*time.Second, "")
 	flags.IntVar(&config.MaxRetryCount, "max-retry-count", -1, "")
 	flags.DurationVar(&config.MaxRetryInterval, "max-retry-interval", 0, "")
 	flags.StringVar(&config.Proxy, "proxy", "", "")
+	flags.StringVar(&config.TLS.CA, "tls-ca", "", "")
+	flags.BoolVar(&config.TLS.SkipVerify, "tls-skip-verify", false, "")
 	flags.Var(&headerFlags{config.Headers}, "header", "")
 	hostname := flags.String("hostname", "", "")
 	pid := flags.Bool("pid", false, "")
@@ -357,8 +412,12 @@ func client(args []string) {
 	if *pid {
 		generatePidFile()
 	}
-	go chshare.GoStats()
-	if err = c.Run(); err != nil {
+	go cos.GoStats()
+	ctx := cos.InterruptContext()
+	if err := c.Start(ctx); err != nil {
+		log.Fatal(err)
+	}
+	if err := c.Wait(); err != nil {
 		log.Fatal(err)
 	}
 }

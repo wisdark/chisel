@@ -1,15 +1,15 @@
-package chshare
+package settings
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
-	"path/filepath"
 	"regexp"
 	"sync"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/jpillora/chisel/share/cio"
 )
 
 type Users struct {
@@ -44,27 +44,39 @@ func (u *Users) Set(key string, user *User) {
 	u.Unlock()
 }
 
-// Delete a users from the list
+// Del ete a users from the list
 func (u *Users) Del(key string) {
 	u.Lock()
 	delete(u.inner, key)
 	u.Unlock()
 }
 
-// AddUser adds a users to the list
+// AddUser adds a users to the set
 func (u *Users) AddUser(user *User) {
 	u.Set(user.Name, user)
 }
 
+// Reset all users to the given set,
+// Use nil to remove all.
+func (u *Users) Reset(users []*User) {
+	m := map[string]*User{}
+	for _, u := range users {
+		m[u.Name] = u
+	}
+	u.Lock()
+	u.inner = m
+	u.Unlock()
+}
+
 // UserIndex is a reloadable user source
 type UserIndex struct {
-	*Logger
+	*cio.Logger
 	*Users
 	configFile string
 }
 
 // NewUserIndex creates a source for users
-func NewUserIndex(logger *Logger) *UserIndex {
+func NewUserIndex(logger *cio.Logger) *UserIndex {
 	return &UserIndex{
 		Logger: logger.Fork("users"),
 		Users:  NewUsers(),
@@ -74,7 +86,7 @@ func NewUserIndex(logger *Logger) *UserIndex {
 // LoadUsers is responsible for loading users from a file
 func (u *UserIndex) LoadUsers(configFile string) error {
 	u.configFile = configFile
-	u.Infof("Loading the configuraion from: %s", configFile)
+	u.Infof("Loading configuration file %s", configFile)
 	if err := u.loadUserIndex(); err != nil {
 		return err
 	}
@@ -90,15 +102,11 @@ func (u *UserIndex) addWatchEvents() error {
 	if err != nil {
 		return err
 	}
-	configDir := filepath.Dir(u.configFile)
-	if err := watcher.Add(configDir); err != nil {
+	if err := watcher.Add(u.configFile); err != nil {
 		return err
 	}
 	go func() {
 		for e := range watcher.Events {
-			if e.Name != u.configFile {
-				continue
-			}
 			if e.Op&fsnotify.Write != fsnotify.Write {
 				continue
 			}
@@ -125,6 +133,7 @@ func (u *UserIndex) loadUserIndex() error {
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return errors.New("Invalid JSON: " + err.Error())
 	}
+	users := []*User{}
 	for auth, remotes := range raw {
 		user := &User{}
 		user.Name, user.Pass = ParseAuth(auth)
@@ -141,9 +150,10 @@ func (u *UserIndex) loadUserIndex() error {
 				}
 				user.Addrs = append(user.Addrs, re)
 			}
-
 		}
-		u.Users.AddUser(user)
+		users = append(users, user)
 	}
+	//swap
+	u.Reset(users)
 	return nil
 }
