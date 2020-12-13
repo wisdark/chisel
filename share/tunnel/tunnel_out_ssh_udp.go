@@ -9,9 +9,15 @@ import (
 	"time"
 
 	"github.com/jpillora/chisel/share/cio"
+	"github.com/jpillora/chisel/share/settings"
 )
 
 func (t *Tunnel) handleUDP(l *cio.Logger, rwc io.ReadWriteCloser, hostPort string) error {
+	conns := &udpConns{
+		Logger: l,
+		m:      map[string]*udpConn{},
+	}
+	defer conns.closeAll()
 	h := &udpHandler{
 		Logger:   l,
 		hostPort: hostPort,
@@ -20,10 +26,7 @@ func (t *Tunnel) handleUDP(l *cio.Logger, rwc io.ReadWriteCloser, hostPort strin
 			w: gob.NewEncoder(rwc),
 			c: rwc,
 		},
-		udpConns: &udpConns{
-			Logger: l,
-			m:      map[string]*udpConn{},
-		},
+		udpConns: conns,
 	}
 	for {
 		p := udpPacket{}
@@ -78,8 +81,7 @@ func (h *udpHandler) handleRead(p *udpPacket, conn *udpConn) {
 	buff := make([]byte, maxMTU)
 	for {
 		//response must arrive within 15 seconds
-		//TODO configurable
-		const deadline = 15 * time.Second
+		deadline := settings.EnvDuration("UDP_DEADLINE", 15*time.Second)
 		conn.SetReadDeadline(time.Now().Add(deadline))
 		//read response
 		n, err := conn.Read(buff)
@@ -133,6 +135,15 @@ func (cs *udpConns) len() int {
 func (cs *udpConns) remove(id string) {
 	cs.Lock()
 	delete(cs.m, id)
+	cs.Unlock()
+}
+
+func (cs *udpConns) closeAll() {
+	cs.Lock()
+	for id, conn := range cs.m {
+		conn.Close()
+		delete(cs.m, id)
+	}
 	cs.Unlock()
 }
 

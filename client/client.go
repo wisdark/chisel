@@ -2,11 +2,12 @@ package chclient
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -16,12 +17,10 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/jpillora/backoff"
 	chshare "github.com/jpillora/chisel/share"
 	"github.com/jpillora/chisel/share/ccrypto"
 	"github.com/jpillora/chisel/share/cio"
 	"github.com/jpillora/chisel/share/cnet"
-	"github.com/jpillora/chisel/share/cos"
 	"github.com/jpillora/chisel/share/settings"
 	"github.com/jpillora/chisel/share/tunnel"
 
@@ -45,9 +44,12 @@ type Config struct {
 	DialContext      func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
+//TLSConfig for a Client
 type TLSConfig struct {
 	SkipVerify bool
 	CA         string
+	Cert       string
+	Key        string
 }
 
 //Client represents a client instance
@@ -105,6 +107,7 @@ func NewClient(c *Config) (*Client, error) {
 	//configure tls
 	if u.Scheme == "wss" {
 		tc := &tls.Config{}
+		//certificate verification config
 		if c.TLS.SkipVerify {
 			client.Infof("TLS verification disabled")
 			tc.InsecureSkipVerify = true
@@ -118,6 +121,16 @@ func NewClient(c *Config) (*Client, error) {
 				client.Infof("TLS verification using CA %s", c.TLS.CA)
 				tc.RootCAs = rootCAs
 			}
+		}
+		//provide client cert and key pair for mtls
+		if c.TLS.Cert != "" && c.TLS.Key != "" {
+			c, err := tls.LoadX509KeyPair(c.TLS.Cert, c.TLS.Key)
+			if err != nil {
+				return nil, fmt.Errorf("Error loading client cert and key pair: %v", err)
+			}
+			tc.Certificates = []tls.Certificate{c}
+		} else if c.TLS.Cert != "" || c.TLS.Key != "" {
+			return nil, fmt.Errorf("Please specify client BOTH cert and key")
 		}
 		client.tlsConfig = tc
 	}
@@ -140,8 +153,8 @@ func NewClient(c *Config) (*Client, error) {
 			hasStdio = true
 		}
 		//confirm non-reverse tunnel is available
-		if !r.Reverse && !r.CanListen() {
-			return nil, fmt.Errorf("Remote %s cannot listen", r.String())
+		if !r.Reverse && !r.Stdio && !r.CanListen() {
+			return nil, fmt.Errorf("Client cannot listen on %s", r.String())
 		}
 		client.computed.Remotes = append(client.computed.Remotes, r)
 	}
@@ -159,7 +172,7 @@ func NewClient(c *Config) (*Client, error) {
 		Auth:            []ssh.AuthMethod{ssh.Password(pass)},
 		ClientVersion:   "SSH-" + chshare.ProtocolVersion + "-client",
 		HostKeyCallback: client.verifyServer,
-		Timeout:         30 * time.Second,
+		Timeout:         settings.EnvDuration("SSH_TIMEOUT", 30*time.Second),
 	}
 	//prepare client tunnel
 	client.tunnel = tunnel.New(tunnel.Config{
@@ -183,12 +196,37 @@ func (c *Client) Run() error {
 
 func (c *Client) verifyServer(hostname string, remote net.Addr, key ssh.PublicKey) error {
 	expect := c.config.Fingerprint
+	if expect == "" {
+		return nil
+	}
 	got := ccrypto.FingerprintKey(key)
-	if expect != "" && !strings.HasPrefix(got, expect) {
+	_, err := base64.StdEncoding.DecodeString(expect)
+	if _, ok := err.(base64.CorruptInputError); ok {
+		c.Logger.Infof("Specified deprecated MD5 fingerprint (%s), please update to the new SHA256 fingerprint: %s", expect, got)
+		return c.verifyLegacyFingerprint(key)
+	} else if err != nil {
+		return fmt.Errorf("Error decoding fingerprint: %w", err)
+	}
+	if got != expect {
 		return fmt.Errorf("Invalid fingerprint (%s)", got)
 	}
 	//overwrite with complete fingerprint
 	c.Infof("Fingerprint %s", got)
+	return nil
+}
+
+//verifyLegacyFingerprint calculates and compares legacy MD5 fingerprints
+func (c *Client) verifyLegacyFingerprint(key ssh.PublicKey) error {
+	bytes := md5.Sum(key.Marshal())
+	strbytes := make([]string, len(bytes))
+	for i, b := range bytes {
+		strbytes[i] = fmt.Sprintf("%02x", b)
+	}
+	got := strings.Join(strbytes, ":")
+	expect := c.config.Fingerprint
+	if !strings.HasPrefix(got, expect) {
+		return fmt.Errorf("Invalid fingerprint (%s)", got)
+	}
 	return nil
 }
 
@@ -203,131 +241,19 @@ func (c *Client) Start(ctx context.Context) error {
 		via = " via " + c.proxyURL.String()
 	}
 	c.Infof("Connecting to %s%s\n", c.server, via)
-	//connect chisel server
+	//connect to chisel server
 	eg.Go(func() error {
 		return c.connectionLoop(ctx)
 	})
 	//listen sockets
 	eg.Go(func() error {
 		clientInbound := c.computed.Remotes.Reversed(false)
+		if len(clientInbound) == 0 {
+			return nil
+		}
 		return c.tunnel.BindRemotes(ctx, clientInbound)
 	})
 	return nil
-}
-
-func (c *Client) connectionLoop(ctx context.Context) error {
-	//connection loop!
-	b := &backoff.Backoff{Max: c.config.MaxRetryInterval}
-	for {
-		connected, retry, err := c.connectionOnce(ctx)
-		//reset backoff after successful connections
-		if connected {
-			b.Reset()
-		}
-		//connection error
-		attempt := int(b.Attempt())
-		maxAttempt := c.config.MaxRetryCount
-		if err != nil {
-			//show error and attempt counts
-			msg := fmt.Sprintf("Connection error: %s", err)
-			if attempt > 0 {
-				msg += fmt.Sprintf(" (Attempt: %d", attempt)
-				if maxAttempt > 0 {
-					msg += fmt.Sprintf("/%d", maxAttempt)
-				}
-				msg += ")"
-			}
-			c.Debugf(msg)
-		}
-		//give up?
-		if !retry || (maxAttempt >= 0 && attempt >= maxAttempt) {
-			break
-		}
-		d := b.Duration()
-		c.Infof("Retrying in %s...", d)
-		select {
-		case <-cos.AfterSignal(d):
-			continue //retry now
-		case <-ctx.Done():
-			c.Infof("Cancelled")
-			return nil
-		}
-	}
-	c.Close()
-	return nil
-}
-
-//connectionOnce connects to the chisel server and blocks
-func (c *Client) connectionOnce(ctx context.Context) (connected, retry bool, err error) {
-	//already closed?
-	select {
-	case <-ctx.Done():
-		return false, false, io.EOF
-	default:
-		//still open
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	//prepare dialer
-	d := websocket.Dialer{
-		HandshakeTimeout: 45 * time.Second,
-		Subprotocols:     []string{chshare.ProtocolVersion},
-		TLSClientConfig:  c.tlsConfig,
-	}
-	//optional proxy
-	if p := c.proxyURL; p != nil {
-		if err := c.setProxy(p, &d); err != nil {
-			return false, false, err
-		}
-	}
-	wsConn, _, err := d.DialContext(ctx, c.server, c.config.Headers)
-	if err != nil {
-		return false, true, err
-	}
-	conn := cnet.NewWebSocketConn(wsConn)
-	// perform SSH handshake on net.Conn
-	c.Debugf("Handshaking...")
-	sshConn, chans, reqs, err := ssh.NewClientConn(conn, "", c.sshConfig)
-	if err != nil {
-		if strings.Contains(err.Error(), "unable to authenticate") {
-			c.Infof("Authentication failed")
-			c.Debugf(err.Error())
-			retry = false
-		} else if n, ok := err.(net.Error); ok && !n.Temporary() {
-			c.Infof(err.Error())
-			retry = false
-		} else {
-			c.Infof("retriable: %s", err.Error())
-			retry = true
-		}
-		return false, retry, err
-	}
-	defer sshConn.Close()
-	// chisel client handshake (reverse of server handshake)
-	// send configuration
-	c.Debugf("Sending config")
-	t0 := time.Now()
-	_, configerr, err := sshConn.SendRequest(
-		"config",
-		true,
-		settings.EncodeConfig(c.computed),
-	)
-	if err != nil {
-		c.Infof("Config verification failed")
-		return false, false, err
-	}
-	if len(configerr) > 0 {
-		return false, false, errors.New(string(configerr))
-	}
-	c.Infof("Connected (Latency %s)", time.Since(t0))
-	//connected, handover ssh connection for tunnel to use, and block
-	retry = true
-	err = c.tunnel.BindSSH(ctx, sshConn, reqs, chans)
-	if n, ok := err.(net.Error); ok && !n.Temporary() {
-		retry = false
-	}
-	c.Infof("Disconnected")
-	return true, retry, err
 }
 
 func (c *Client) setProxy(u *url.URL, d *websocket.Dialer) error {

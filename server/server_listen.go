@@ -2,12 +2,15 @@ package chserver
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"io/ioutil"
 	"net"
 	"os"
 	"os/user"
 	"path/filepath"
 
+	"github.com/jpillora/chisel/share/settings"
 	"golang.org/x/crypto/acme/autocert"
 )
 
@@ -16,6 +19,7 @@ type TLSConfig struct {
 	Key     string
 	Cert    string
 	Domains []string
+	CA      string
 }
 
 func (s *Server) listener(host, port string) (net.Listener, error) {
@@ -30,13 +34,13 @@ func (s *Server) listener(host, port string) (net.Listener, error) {
 	}
 	extra := ""
 	if hasKeyCert {
-		c, err := tlsKeyCert(s.config.TLS.Key, s.config.TLS.Cert)
+		c, err := s.tlsKeyCert(s.config.TLS.Key, s.config.TLS.Cert, s.config.TLS.CA)
 		if err != nil {
 			return nil, err
 		}
 		tlsConf = c
-		if port != "443" {
-			extra = " (WARNING: lets-encrypt must connect to your domains on port 443)"
+		if port != "443" && hasDomains {
+			extra = " (WARNING: LetsEncrypt will attempt to connect to your domain on port 443)"
 		}
 	}
 	//tcp listen
@@ -60,11 +64,11 @@ func (s *Server) tlsLetsEncrypt(domains []string) *tls.Config {
 			s.Infof("Accepting LetsEncrypt TOS and fetching certificate...")
 			return true
 		},
-		Email:      os.Getenv("CHISEL_LE_EMAIL"),
+		Email:      settings.Env("LE_EMAIL"),
 		HostPolicy: autocert.HostWhitelist(domains...),
 	}
 	//configure file cache
-	c := os.Getenv("CHISEL_LE_CACHE")
+	c := settings.Env("LE_CACHE")
 	if c == "" {
 		h := os.Getenv("HOME")
 		if h == "" {
@@ -82,13 +86,63 @@ func (s *Server) tlsLetsEncrypt(domains []string) *tls.Config {
 	return m.TLSConfig()
 }
 
-func tlsKeyCert(key, cert string) (*tls.Config, error) {
-	c, err := tls.LoadX509KeyPair(cert, key)
+func (s *Server) tlsKeyCert(key, cert string, ca string) (*tls.Config, error) {
+	keypair, err := tls.LoadX509KeyPair(cert, key)
 	if err != nil {
 		return nil, err
 	}
-	//return file based tls config using tls defaults
-	return &tls.Config{
-		Certificates: []tls.Certificate{c},
-	}, nil
+	//file based tls config using tls defaults
+	c := &tls.Config{
+		Certificates: []tls.Certificate{keypair},
+	}
+	//mTLS requires server's CA
+	if ca != "" {
+		if err := addCA(ca, c); err != nil {
+			return nil, err
+		}
+		s.Infof("Loaded CA path: %s", ca)
+	}
+	return c, nil
+}
+
+func addCA(ca string, c *tls.Config) error {
+	fileInfo, err := os.Stat(ca)
+	if err != nil {
+		return err
+	}
+	clientCAPool := x509.NewCertPool()
+	if fileInfo.IsDir() {
+		//this is a directory holding CA bundle files
+		files, err := ioutil.ReadDir(ca)
+		if err != nil {
+			return err
+		}
+		//add all cert files from path
+		for _, file := range files {
+			f := file.Name()
+			if err := addPEMFile(filepath.Join(ca, f), clientCAPool); err != nil {
+				return err
+			}
+		}
+	} else {
+		//this is a CA bundle file
+		if err := addPEMFile(ca, clientCAPool); err != nil {
+			return err
+		}
+	}
+	//set client CAs and enable cert verification
+	c.ClientCAs = clientCAPool
+	c.ClientAuth = tls.RequireAndVerifyClientCert
+	return nil
+}
+
+func addPEMFile(path string, pool *x509.CertPool) error {
+	content, err := ioutil.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if !pool.AppendCertsFromPEM(content) {
+		return errors.New("Fail to load certificates from : " + path)
+	}
+	return nil
 }

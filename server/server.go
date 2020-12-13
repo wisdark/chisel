@@ -46,7 +46,9 @@ type Server struct {
 }
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin:     func(r *http.Request) bool { return true },
+	ReadBufferSize:  settings.EnvInt("WS_BUFF_SIZE", 0),
+	WriteBufferSize: settings.EnvInt("WS_BUFF_SIZE", 0),
 }
 
 // NewServer creates and returns a new chisel server
@@ -125,7 +127,7 @@ func (s *Server) Run(host, port string) error {
 
 // Start is responsible for kicking off the http server
 func (s *Server) Start(host, port string) error {
-	return s.StartContext(nil, host, port)
+	return s.StartContext(context.Background(), host, port)
 }
 
 // StartContext is responsible for kicking off the http server,
